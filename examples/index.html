@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FlipFolio Demo</title>
+  <link rel="stylesheet" href="../dist/flipfolio.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      background: #1a1a2e;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      color: #e0e0e0;
+      padding: 20px;
+    }
+    h1 {
+      margin-bottom: 10px;
+      font-size: 28px;
+      font-weight: 300;
+      letter-spacing: 2px;
+      color: #f0f0f0;
+    }
+    .subtitle {
+      margin-bottom: 30px;
+      font-size: 14px;
+      color: #888;
+    }
+    #book-container {
+      width: 100%;
+      max-width: 860px;
+    }
+    .controls {
+      margin-top: 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .controls button {
+      padding: 8px 24px;
+      border: 1px solid #444;
+      background: #2a2a4a;
+      color: #e0e0e0;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: background 0.2s;
+    }
+    .controls button:hover {
+      background: #3a3a6a;
+    }
+    #page-info {
+      font-size: 14px;
+      color: #aaa;
+      min-width: 120px;
+      text-align: center;
+    }
+
+    /* Demo page styles */
+    .cover-page {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      background: linear-gradient(135deg, #2c3e50, #4a6741);
+      color: #fff;
+      text-align: center;
+      padding: 40px;
+    }
+    .cover-page h2 {
+      font-size: 32px;
+      margin-bottom: 12px;
+      font-weight: 300;
+      letter-spacing: 3px;
+    }
+    .cover-page p {
+      font-size: 16px;
+      opacity: 0.8;
+    }
+    .text-page {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      height: 100%;
+      padding: 40px;
+      line-height: 1.8;
+      font-size: 15px;
+      color: #333;
+    }
+    .text-page h3 {
+      font-size: 20px;
+      margin-bottom: 16px;
+      color: #2c3e50;
+    }
+    .text-page p {
+      margin-bottom: 12px;
+    }
+    .chapter-title {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      background: #f8f5f0;
+      color: #333;
+      text-align: center;
+    }
+    .chapter-title h3 {
+      font-size: 28px;
+      font-weight: 300;
+      letter-spacing: 2px;
+      border-bottom: 1px solid #ccc;
+      padding-bottom: 10px;
+    }
+    .back-cover {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      background: linear-gradient(135deg, #4a6741, #2c3e50);
+      color: #fff;
+      text-align: center;
+    }
+    .back-cover p {
+      font-size: 14px;
+      opacity: 0.7;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>FlipFolio</h1>
+  <p class="subtitle">Drag pages, use arrow keys, or click buttons to flip</p>
+
+  <div id="book-container"></div>
+
+  <div class="controls">
+    <button id="btn-prev">Previous</button>
+    <span id="page-info"></span>
+    <button id="btn-next">Next</button>
+  </div>
+
+  <script src="../dist/flipfolio.umd.js"></script>
+  <script>
+    const pages = [
+      // Leaf 0 front (right page at start)
+      {
+        type: 'html',
+        content: `
+          <div class="cover-page">
+            <h2>FlipFolio</h2>
+            <p>A CSS 3D Book Component</p>
+          </div>`
+      },
+      // Leaf 0 back (left page after first flip)
+      {
+        type: 'html',
+        content: `
+          <div class="text-page">
+            <h3>Welcome</h3>
+            <p>This is a demonstration of the FlipFolio component, built with pure vanilla JavaScript and CSS 3D transforms.</p>
+            <p>Each leaf is a sheet of paper with content on both sides. Drag, click buttons, or use arrow keys to turn pages.</p>
+          </div>`
+      },
+      // Leaf 1 front
+      {
+        type: 'html',
+        content: `
+          <div class="chapter-title">
+            <h3>Chapter 1</h3>
+          </div>`
+      },
+      // Leaf 1 back
+      {
+        type: 'html',
+        content: `
+          <div class="text-page">
+            <h3>How It Works</h3>
+            <p>Each "leaf" represents a single sheet of paper with two sides. The front face shows the right-hand page (recto), and the back face shows the left-hand page (verso).</p>
+            <p>When a page is turned forward, the leaf rotates from 0 to -180 degrees around the spine, revealing the back face content on the left side.</p>
+          </div>`
+      },
+      // Leaf 2 front
+      {
+        type: 'html',
+        content: `
+          <div class="text-page" style="align-items: center; background: #f0f0f0;">
+            <h3>Image Pages</h3>
+            <p style="text-align: center;">FlipFolio supports image URLs as pages. Simply pass a URL string or use <code>{type: 'image', src: '...'}</code>.</p>
+            <div style="width: 200px; height: 200px; background: linear-gradient(45deg, #e8d5b7 25%, #f5e6d3 25%, #f5e6d3 50%, #e8d5b7 50%, #e8d5b7 75%, #f5e6d3 75%); background-size: 40px 40px; border-radius: 8px; margin-top: 16px;"></div>
+          </div>`
+      },
+      // Leaf 2 back
+      {
+        type: 'html',
+        content: `
+          <div class="text-page">
+            <h3>Features</h3>
+            <p><strong>Drag to flip</strong> - Grab a page edge and drag to turn.</p>
+            <p><strong>Keyboard</strong> - Arrow keys, PageUp/Down, Home/End.</p>
+            <p><strong>Responsive</strong> - Scales to fit the container.</p>
+            <p><strong>Touch support</strong> - Works on mobile via Pointer Events.</p>
+            <p><strong>Double-sided</strong> - Both sides of each leaf show content.</p>
+          </div>`
+      },
+      // Leaf 3 front
+      {
+        type: 'html',
+        content: `
+          <div class="chapter-title">
+            <h3>Chapter 2</h3>
+          </div>`
+      },
+      // Leaf 3 back
+      {
+        type: 'html',
+        content: `
+          <div class="text-page">
+            <h3>API</h3>
+            <p><code>flipNext()</code> - Flip to next page</p>
+            <p><code>flipPrev()</code> - Flip to previous page</p>
+            <p><code>flipTo(pageIndex)</code> - Jump to a specific page</p>
+            <p><code>on('flip', callback)</code> - Listen for page turns</p>
+            <p><code>destroy()</code> - Clean up and remove</p>
+          </div>`
+      },
+      // Leaf 4 front
+      {
+        type: 'html',
+        content: `
+          <div class="text-page">
+            <h3>Usage</h3>
+            <p>Install via npm:</p>
+            <pre style="background:#f5f5f5;padding:12px;border-radius:6px;font-size:13px;margin:8px 0;"><code>npm install flipfolio</code></pre>
+            <pre style="background:#f5f5f5;padding:12px;border-radius:6px;font-size:13px;overflow-x:auto;"><code>import FlipFolio from 'flipfolio';
+import 'flipfolio/css';
+
+const book = new FlipFolio('#el', {
+  width: 800,
+  height: 600,
+  pages: [...]
+});</code></pre>
+          </div>`
+      },
+      // Leaf 4 back
+      {
+        type: 'html',
+        content: `
+          <div class="back-cover">
+            <p>FlipFolio</p>
+            <p style="margin-top: 8px; font-size: 12px;">Pure JS + CSS 3D Transforms</p>
+          </div>`
+      },
+    ];
+
+    const book = new FlipFolio('#book-container', {
+      width: 800,
+      height: 560,
+      pages: pages,
+    });
+
+    const pageInfo = document.getElementById('page-info');
+    const btnPrev = document.getElementById('btn-prev');
+    const btnNext = document.getElementById('btn-next');
+
+    function updatePageInfo() {
+      const leaf = book.currentPage;
+      const total = book.pageCount;
+      const leafCount = Math.ceil(total / 2);
+
+      if (leaf === 0) {
+        pageInfo.textContent = `Page 1 / ${total}`;
+      } else if (leaf >= leafCount) {
+        pageInfo.textContent = `Page ${total} / ${total}`;
+      } else {
+        const left = leaf * 2;
+        const right = Math.min(leaf * 2 + 1, total);
+        pageInfo.textContent = `Pages ${left}-${right} / ${total}`;
+      }
+    }
+
+    updatePageInfo();
+    book.on('flip', updatePageInfo);
+
+    btnPrev.addEventListener('click', () => book.flipPrev());
+    btnNext.addEventListener('click', () => book.flipNext());
+  </script>
+
+</body>
+</html>

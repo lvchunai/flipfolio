@@ -1,0 +1,7 @@
+examples/
+docs/
+.git/
+.gitignore
+.DS_Store
+node_modules/
+rollup.config.mjs

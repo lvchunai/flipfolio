@@ -1,0 +1,37 @@
+{
+  "name": "flipfolio",
+  "version": "1.0.0",
+  "description": "A pure vanilla JS page-flip book component using CSS 3D transforms",
+  "main": "dist/flipfolio.umd.js",
+  "module": "dist/flipfolio.esm.js",
+  "exports": {
+    ".": {
+      "import": "./dist/flipfolio.esm.js",
+      "require": "./dist/flipfolio.umd.js"
+    },
+    "./css": "./dist/flipfolio.css"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "rollup -c",
+    "dev": "rollup -c -w"
+  },
+  "keywords": [
+    "flipbook",
+    "page-flip",
+    "book",
+    "3d",
+    "css-transform",
+    "vanilla-js"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "rollup": "^4.9.0",
+    "rollup-plugin-copy": "^3.5.0",
+    "@rollup/plugin-terser": "^0.4.4"
+  }
+}
