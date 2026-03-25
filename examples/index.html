@@ -4,7 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>FlipFolio Demo</title>
-  <link rel="stylesheet" href="../dist/flipfolio.css">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -146,6 +145,8 @@
     <button id="btn-next">Next</button>
   </div>
 
+  <script src="https://unpkg.com/three@0.159.0/build/three.min.js"></script>
+  <script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
   <script src="../dist/flipfolio.umd.js"></script>
   <script>
     const pages = [
@@ -155,7 +156,7 @@
         content: `
           <div class="cover-page">
             <h2>FlipFolio</h2>
-            <p>A CSS 3D Book Component</p>
+            <p>A WebGL Book Component</p>
           </div>`
       },
       // Leaf 0 back (left page after first flip)
@@ -164,7 +165,7 @@
         content: `
           <div class="text-page">
             <h3>Welcome</h3>
-            <p>This is a demonstration of the FlipFolio component, built with pure vanilla JavaScript and CSS 3D transforms.</p>
+            <p>This is a demonstration of the FlipFolio component, built with vanilla JavaScript and Three.js WebGL rendering.</p>
             <p>Each leaf is a sheet of paper with content on both sides. Drag, click buttons, or use arrow keys to turn pages.</p>
           </div>`
       },
@@ -183,7 +184,7 @@
           <div class="text-page">
             <h3>How It Works</h3>
             <p>Each "leaf" represents a single sheet of paper with two sides. The front face shows the right-hand page (recto), and the back face shows the left-hand page (verso).</p>
-            <p>When a page is turned forward, the leaf rotates from 0 to -180 degrees around the spine, revealing the back face content on the left side.</p>
+            <p>When a page is turned forward, the leaf bends with a realistic cylindrical curl, revealing the back face content on the left side.</p>
           </div>`
       },
       // Leaf 2 front
@@ -206,7 +207,7 @@
             <p><strong>Keyboard</strong> - Arrow keys, PageUp/Down, Home/End.</p>
             <p><strong>Responsive</strong> - Scales to fit the container.</p>
             <p><strong>Touch support</strong> - Works on mobile via Pointer Events.</p>
-            <p><strong>Double-sided</strong> - Both sides of each leaf show content.</p>
+            <p><strong>WebGL 3D</strong> - True paper bending with cylindrical curl.</p>
           </div>`
       },
       // Leaf 3 front
@@ -254,7 +255,7 @@ const book = new FlipFolio('#el', {
         content: `
           <div class="back-cover">
             <p>FlipFolio</p>
-            <p style="margin-top: 8px; font-size: 12px;">Pure JS + CSS 3D Transforms</p>
+            <p style="margin-top: 8px; font-size: 12px;">WebGL + Three.js</p>
           </div>`
       },
     ];
@@ -287,6 +288,7 @@ const book = new FlipFolio('#el', {
 
     updatePageInfo();
     book.on('flip', updatePageInfo);
+    book.on('ready', () => console.log('FlipFolio ready'));
 
     btnPrev.addEventListener('click', () => book.flipPrev());
     btnNext.addEventListener('click', () => book.flipNext());

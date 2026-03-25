@@ -1,9 +1,25 @@
 /**
- * FlipFolio - A pure vanilla JS page-flip book component
- * Uses CSS 3D Transforms for realistic book page-turning effects
+ * FlipFolio - A vanilla JS page-flip book component
+ * Uses Three.js WebGL for realistic paper bending with cylindrical curl deformation
  * 2-pages-per-leaf: front = recto (right), back = verso (left when flipped)
- * Curl effect inspired by WowBook's fold gradient technique
  */
+
+import {
+  WebGLRenderer,
+  Scene,
+  PerspectiveCamera,
+  AmbientLight,
+  DirectionalLight,
+  PlaneGeometry,
+  ShaderMaterial,
+  DoubleSide,
+  Mesh,
+  CanvasTexture,
+  TextureLoader,
+  SRGBColorSpace,
+  MeshBasicMaterial,
+  FrontSide,
+} from 'three';
 
 const DEFAULTS = {
   width: 800,
@@ -11,19 +27,14 @@ const DEFAULTS = {
   pages: [],
   startPage: 0,
   duration: 0.7,
-  timing: 'cubic-bezier(0.4, 0.0, 0.2, 1.0)',
   dragThreshold: 0.3,
   responsive: true,
   keyboard: true,
   clickToFlip: false,
-  showSpineShadow: true,
   autoInjectCSS: true,
   cornerCurl: true,
-  cornerCurlAngle: 28,
   edgeCurlZone: 60,
-  pageThickness: 0.5,
-  maxStackOffset: 6,
-  velocityThreshold: 200,
+  velocityThreshold: 0.4, // in progress/s now (0-1 range)
 };
 
 let cssInjected = false;
@@ -32,30 +43,286 @@ function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
 }
 
+// ===== Bend Deformation Algorithm =====
+
 /**
- * Newton-Raphson cubic bezier solver.
- * Maps elapsed fraction x → eased value y for a given cubic-bezier curve.
+ * Deform a PlaneGeometry to simulate cylindrical paper fold.
+ * @param {Float32Array} posArray - geometry position attribute array (mutated)
+ * @param {Float32Array} origArray - original vertex positions (read-only)
+ * @param {number} flipProgress - 0 (flat right) to 1 (flat left)
+ * @param {number} pageWidth - width of the page
+ * @param {number} curlRadius - radius of the curl cylinder
  */
-function cubicBezierSolver(x1, y1, x2, y2) {
-  return function (x) {
-    if (x <= 0) return 0;
-    if (x >= 1) return 1;
-    let t = x;
-    for (let i = 0; i < 8; i++) {
-      const ct = 1 - t;
-      const bx = 3 * ct * ct * t * x1 + 3 * ct * t * t * x2 + t * t * t;
-      const dx = 3 * ct * ct * x1 + 6 * ct * t * (x2 - x1) + 3 * t * t * (1 - x2);
-      if (Math.abs(dx) < 1e-6) break;
-      t -= (bx - x) / dx;
-      t = clamp(t, 0, 1);
+function deformPageGeometry(posArray, origArray, flipProgress, pageWidth, curlRadius) {
+  const foldX = pageWidth * (1 - flipProgress);
+  const R = curlRadius;
+  const PI = Math.PI;
+
+  for (let i = 0; i < origArray.length; i += 3) {
+    const ox = origArray[i], oy = origArray[i + 1];
+
+    if (ox <= foldX) {
+      // Flat right side (not yet turned)
+      posArray[i] = ox;
+      posArray[i + 1] = oy;
+      posArray[i + 2] = 0;
+    } else {
+      const d = ox - foldX;
+      const theta = d / R;
+
+      if (theta <= PI) {
+        // Cylinder arc
+        posArray[i] = foldX + R * (Math.cos(theta) - 1);
+        posArray[i + 1] = oy;
+        posArray[i + 2] = R * Math.sin(theta);
+      } else {
+        // Flat left side (past arc)
+        const excess = d - PI * R;
+        posArray[i] = foldX - 2 * R - excess;
+        posArray[i + 1] = oy;
+        posArray[i + 2] = 0;
+      }
     }
-    const ct = 1 - t;
-    return 3 * ct * ct * t * y1 + 3 * ct * t * t * y2 + t * t * t;
-  };
+  }
 }
 
-const naturalEase = cubicBezierSolver(0.4, 0.0, 0.2, 1.0);
-const easeOut = cubicBezierSolver(0, 0, 0.2, 1);
+/**
+ * Compute dynamic curl radius that varies with flip progress.
+ * Peaks at progress=0.5 (mid-flip) for maximum visible curl.
+ */
+function computeCurlRadius(progress, pageWidth) {
+  const R_MIN = pageWidth * 0.01;
+  const R_MAX = pageWidth * 0.06;
+  const midDist = Math.sin(progress * Math.PI); // peaks at 0.5
+  return R_MIN + (R_MAX - R_MIN) * midDist;
+}
+
+// ===== Easing =====
+
+function easeOutCubic(t) {
+  return 1 - Math.pow(1 - t, 3);
+}
+
+function easeInOutCubic(t) {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+// ===== Shader =====
+
+const PAGE_VERTEX_SHADER = `
+varying vec2 vUv;
+varying vec3 vNormal;
+void main() {
+  vUv = uv;
+  vNormal = normalize(normalMatrix * normal);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const PAGE_FRAGMENT_SHADER = `
+uniform sampler2D frontTex;
+uniform sampler2D backTex;
+uniform float shadowIntensity;
+varying vec2 vUv;
+varying vec3 vNormal;
+void main() {
+  vec4 color;
+  if (gl_FrontFacing) {
+    color = texture2D(frontTex, vUv);
+  } else {
+    color = texture2D(backTex, vec2(1.0 - vUv.x, vUv.y));
+  }
+  // Simple diffuse lighting
+  vec3 n = gl_FrontFacing ? vNormal : -vNormal;
+  float light = 0.65 + 0.35 * max(dot(n, normalize(vec3(0.0, 0.5, 1.0))), 0.0);
+  color.rgb *= light;
+  // Apply shadow overlay for depth stacking
+  color.rgb *= (1.0 - shadowIntensity);
+  gl_FragColor = vec4(color.rgb, 1.0);
+}
+`;
+
+// ===== Texture Pipeline =====
+
+/**
+ * Create a white canvas texture as fallback.
+ */
+function createWhiteTexture(width, height) {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, width, height);
+  const tex = new CanvasTexture(canvas);
+  tex.colorSpace = SRGBColorSpace;
+  return tex;
+}
+
+/**
+ * Render HTML content to a canvas texture using html2canvas or SVG foreignObject fallback.
+ */
+async function htmlToTexture(htmlContent, width, height, className, style) {
+  const container = document.createElement('div');
+  container.style.cssText = `position:fixed;left:-9999px;top:-9999px;width:${width}px;height:${height}px;overflow:hidden;background:#fff;`;
+  container.innerHTML = htmlContent;
+
+  if (className) container.firstElementChild?.classList.add(className);
+  if (style && container.firstElementChild) {
+    Object.assign(container.firstElementChild.style, style);
+  }
+
+  document.body.appendChild(container);
+
+  let tex;
+  try {
+    if (typeof window.html2canvas === 'function') {
+      const canvas = await window.html2canvas(container, {
+        width,
+        height,
+        scale: 2,
+        useCORS: true,
+        backgroundColor: '#ffffff',
+      });
+      tex = new CanvasTexture(canvas);
+      tex.colorSpace = SRGBColorSpace;
+    } else {
+      // SVG foreignObject fallback
+      tex = await svgForeignObjectTexture(container, width, height);
+    }
+  } catch (_) {
+    tex = createWhiteTexture(width, height);
+  } finally {
+    document.body.removeChild(container);
+  }
+
+  return tex;
+}
+
+/**
+ * SVG foreignObject fallback when html2canvas is unavailable.
+ */
+async function svgForeignObjectTexture(element, width, height) {
+  const html = element.outerHTML;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+    <foreignObject width="100%" height="100%">
+      <div xmlns="http://www.w3.org/1999/xhtml" style="width:${width}px;height:${height}px;overflow:hidden;background:#fff;">
+        ${html}
+      </div>
+    </foreignObject>
+  </svg>`;
+
+  const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = width * 2;
+      canvas.height = height * 2;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      const tex = new CanvasTexture(canvas);
+      tex.colorSpace = SRGBColorSpace;
+      resolve(tex);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(createWhiteTexture(width, height));
+    };
+    img.src = url;
+  });
+}
+
+/**
+ * Load a page descriptor into a Three.js texture.
+ */
+async function loadPageTexture(page, pageIndex, width, height) {
+  if (page == null) {
+    return createWhiteTexture(width, height);
+  }
+
+  if (typeof page === 'string') {
+    // Image URL
+    return new Promise((resolve) => {
+      const loader = new TextureLoader();
+      loader.load(
+        page,
+        (tex) => { tex.colorSpace = SRGBColorSpace; resolve(tex); },
+        undefined,
+        () => resolve(createWhiteTexture(width, height))
+      );
+    });
+  }
+
+  if (typeof page === 'object') {
+    if (page.type === 'image') {
+      return new Promise((resolve) => {
+        const loader = new TextureLoader();
+        loader.load(
+          page.src,
+          (tex) => { tex.colorSpace = SRGBColorSpace; resolve(tex); },
+          undefined,
+          () => resolve(createWhiteTexture(width, height))
+        );
+      });
+    }
+
+    if (page.type === 'html') {
+      return htmlToTexture(page.content, width, height, page.className, page.style);
+    }
+
+    if (page.type === 'element') {
+      const container = document.createElement('div');
+      container.style.cssText = `position:fixed;left:-9999px;top:-9999px;width:${width}px;height:${height}px;overflow:hidden;background:#fff;`;
+      container.appendChild(page.element.cloneNode(true));
+      document.body.appendChild(container);
+
+      let tex;
+      try {
+        if (typeof window.html2canvas === 'function') {
+          const canvas = await window.html2canvas(container, {
+            width,
+            height,
+            scale: 2,
+            useCORS: true,
+            backgroundColor: '#ffffff',
+          });
+          tex = new CanvasTexture(canvas);
+          tex.colorSpace = SRGBColorSpace;
+        } else {
+          tex = await svgForeignObjectTexture(container, width, height);
+        }
+      } catch (_) {
+        tex = createWhiteTexture(width, height);
+      } finally {
+        document.body.removeChild(container);
+      }
+      return tex;
+    }
+
+    if (page.type === 'canvas') {
+      const canvas = document.createElement('canvas');
+      canvas.width = width * 2;
+      canvas.height = height * 2;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      if (typeof page.render === 'function') {
+        page.render(ctx, canvas.width, canvas.height);
+      }
+      const tex = new CanvasTexture(canvas);
+      tex.colorSpace = SRGBColorSpace;
+      return tex;
+    }
+  }
+
+  return createWhiteTexture(width, height);
+}
+
+// ===== FlipFolio Class =====
 
 class FlipFolio {
   constructor(container, opts = {}) {
@@ -72,19 +339,19 @@ class FlipFolio {
     this._animating = false;
     this._dragging = false;
     this._dragLeaf = null;
-    this._dragStartX = 0;
-    this._dragAngle = 0;
-    this._curlRAF = null;
     this._listeners = {};
-    this._leaves = [];
+    this._meshes = [];
     this._destroyed = false;
+    this._ready = false;
 
     this._cornerCurling = false;
-    this._cornerLeaf = null;
+    this._cornerMeshIndex = -1;
     this._cornerDir = null;
 
     this._velocitySamples = [];
+    this._flipRAF = null;
 
+    // Bound handlers
     this._onPointerDown = this._handlePointerDown.bind(this);
     this._onPointerMove = this._handlePointerMove.bind(this);
     this._onPointerUp = this._handlePointerUp.bind(this);
@@ -97,23 +364,10 @@ class FlipFolio {
 
     this._build();
     this._bindEvents();
-
-    if (this._opts.startPage > 0) {
-      const startLeaf = Math.min(
-        Math.ceil(this._opts.startPage / 2),
-        this._leafCount
-      );
-      this._currentLeaf = startLeaf;
-      for (let i = 0; i < this._currentLeaf; i++) {
-        this._leaves[i].classList.add('ff-flipped');
-      }
-    }
-
-    this._updateZIndex();
-    if (this._opts.responsive) this._handleResize();
+    this._initAsync();
   }
 
-  // ===== DOM Construction =====
+  // ===== Scene Setup =====
 
   _build() {
     const o = this._opts;
@@ -122,138 +376,243 @@ class FlipFolio {
     this._book.className = 'ff-book' + (o.responsive ? ' ff-responsive' : '');
     this._book.style.setProperty('--ff-width', o.width + 'px');
     this._book.style.setProperty('--ff-height', o.height + 'px');
-    this._book.style.setProperty('--ff-duration', o.duration + 's');
-    this._book.style.setProperty('--ff-timing', o.timing);
     this._book.setAttribute('tabindex', '0');
     this._book.setAttribute('role', 'region');
     this._book.setAttribute('aria-label', 'Book viewer');
 
-    this._pagesEl = document.createElement('div');
-    this._pagesEl.className = 'ff-pages';
+    // Page dimensions (half-width for each page)
+    this._pageWidth = o.width / 2;
+    this._pageHeight = o.height;
 
-    for (let i = 0; i < this._leafCount; i++) {
-      const leaf = this._buildLeaf(i);
-      this._leaves.push(leaf);
-      this._pagesEl.appendChild(leaf);
-    }
+    // Three.js setup
+    this._renderer = new WebGLRenderer({ alpha: true, antialias: true });
+    this._renderer.setSize(o.width, o.height);
+    this._renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this._renderer.outputColorSpace = SRGBColorSpace;
+    this._canvas = this._renderer.domElement;
 
-    this._castShadowLeft = document.createElement('div');
-    this._castShadowLeft.className = 'ff-cast-shadow ff-cast-shadow-left';
-    this._pagesEl.appendChild(this._castShadowLeft);
+    this._scene = new Scene();
 
-    this._castShadowRight = document.createElement('div');
-    this._castShadowRight.className = 'ff-cast-shadow ff-cast-shadow-right';
-    this._pagesEl.appendChild(this._castShadowRight);
+    // Camera: position so the book fills the view
+    const fov = 45;
+    const dist = (this._pageHeight / 2) / Math.tan((fov / 2) * Math.PI / 180);
+    this._camera = new PerspectiveCamera(fov, o.width / o.height, 1, dist * 3);
+    this._camera.position.set(0, 0, dist);
+    this._camera.lookAt(0, 0, 0);
 
-    if (o.showSpineShadow) {
-      this._spineShadow = document.createElement('div');
-      this._spineShadow.className = 'ff-spine-shadow';
-      this._pagesEl.appendChild(this._spineShadow);
-    }
+    // Lighting
+    const ambient = new AmbientLight(0xffffff, 0.7);
+    this._scene.add(ambient);
 
-    this._book.appendChild(this._pagesEl);
+    const dirLight = new DirectionalLight(0xffffff, 0.4);
+    dirLight.position.set(0, dist * 0.5, dist);
+    this._scene.add(dirLight);
+
+    // Spine shadow (vertical semi-transparent plane at x=0)
+    const spineGeo = new PlaneGeometry(8, this._pageHeight);
+    const spineMat = new MeshBasicMaterial({
+      color: 0x000000,
+      transparent: true,
+      opacity: 0.2,
+      depthWrite: false,
+      side: FrontSide,
+    });
+    this._spineShadow = new Mesh(spineGeo, spineMat);
+    this._spineShadow.position.set(0, 0, 0.5);
+    this._spineShadow.renderOrder = 1000;
+    this._scene.add(this._spineShadow);
+
+    this._book.appendChild(this._canvas);
     this._el.appendChild(this._book);
   }
 
-  _buildLeaf(index) {
-    const leaf = document.createElement('div');
-    leaf.className = 'ff-leaf';
-    leaf.dataset.leafIndex = index;
+  /**
+   * Load textures and create meshes asynchronously.
+   */
+  async _initAsync() {
+    const pw = this._pageWidth;
+    const ph = this._pageHeight;
+    const texWidth = Math.round(pw);
+    const texHeight = Math.round(ph);
 
-    const frontPageIndex = index * 2;
-    const backPageIndex = index * 2 + 1;
+    // Load all page textures
+    const textures = await Promise.all(
+      this._pages.map((page, i) => loadPageTexture(page, i, texWidth, texHeight))
+    );
 
-    // Front face = right-hand page (recto)
-    const front = document.createElement('div');
-    front.className = 'ff-face ff-face-front';
+    if (this._destroyed) return;
 
-    const frontContent = document.createElement('div');
-    frontContent.className = 'ff-content';
-    this._renderPage(frontContent, this._pages[frontPageIndex], frontPageIndex);
-    front.appendChild(frontContent);
+    this._textures = textures;
 
-    const frontShadow = document.createElement('div');
-    frontShadow.className = 'ff-shadow ff-shadow-front';
-    front.appendChild(frontShadow);
-
-    const frontCurl = document.createElement('div');
-    frontCurl.className = 'ff-curl ff-curl-front';
-    front.appendChild(frontCurl);
-
-    const frontDepth = document.createElement('div');
-    frontDepth.className = 'ff-depth-shadow-right';
-    front.appendChild(frontDepth);
-
-    // Back face = left-hand page (verso, visible when flipped)
-    const back = document.createElement('div');
-    back.className = 'ff-face ff-face-back';
-
-    const backContent = document.createElement('div');
-    backContent.className = 'ff-content';
-    if (backPageIndex < this._pages.length) {
-      this._renderPage(backContent, this._pages[backPageIndex], backPageIndex);
+    // Create leaf meshes
+    for (let i = 0; i < this._leafCount; i++) {
+      const mesh = this._createLeafMesh(i, textures);
+      this._meshes.push(mesh);
+      this._scene.add(mesh);
     }
-    back.appendChild(backContent);
 
-    const backShadow = document.createElement('div');
-    backShadow.className = 'ff-shadow ff-shadow-back';
-    back.appendChild(backShadow);
+    // Apply startPage
+    if (this._opts.startPage > 0) {
+      const startLeaf = Math.min(
+        Math.ceil(this._opts.startPage / 2),
+        this._leafCount
+      );
+      this._currentLeaf = startLeaf;
+      for (let i = 0; i < this._currentLeaf; i++) {
+        this._setMeshFlat(i, true); // flipped
+      }
+    }
 
-    const backCurl = document.createElement('div');
-    backCurl.className = 'ff-curl ff-curl-back';
-    back.appendChild(backCurl);
+    this._updateMeshOrder();
+    this._render();
 
-    const backDepth = document.createElement('div');
-    backDepth.className = 'ff-depth-shadow';
-    back.appendChild(backDepth);
+    this._ready = true;
+    this._emit('ready');
 
-    leaf.appendChild(front);
-    leaf.appendChild(back);
-
-    // Cache child references to avoid querySelector in animation hot path
-    leaf._ff = {
-      frontFace: front,
-      backFace: back,
-      frontCurl: frontCurl,
-      backCurl: backCurl,
-      frontShadow: frontShadow,
-      backShadow: backShadow,
-      frontDepth: frontDepth,
-      backDepth: backDepth,
-    };
-
-    return leaf;
+    if (this._opts.responsive) this._handleResize();
   }
 
-  _renderPage(container, page, pageIndex) {
-    if (page == null) {
-      container.classList.add('ff-blank');
-      return;
+  /**
+   * Create a PlaneGeometry mesh for a leaf with front/back textures.
+   */
+  _createLeafMesh(leafIndex, textures) {
+    const pw = this._pageWidth;
+    const ph = this._pageHeight;
+    const segments = 40;
+
+    const geo = new PlaneGeometry(pw, ph, segments, 1);
+
+    // Shift vertices so left edge at x=0 (spine), right edge at x=pageWidth
+    const pos = geo.attributes.position.array;
+    for (let i = 0; i < pos.length; i += 3) {
+      pos[i] += pw / 2; // shift from centered to spine-anchored
     }
-    if (typeof page === 'string') {
-      const img = document.createElement('img');
-      img.src = page;
-      img.alt = `Page ${pageIndex + 1}`;
-      img.draggable = false;
-      container.appendChild(img);
-      return;
-    }
-    if (typeof page === 'object') {
-      if (page.type === 'image') {
-        const img = document.createElement('img');
-        img.src = page.src;
-        img.alt = page.alt || `Page ${pageIndex + 1}`;
-        img.draggable = false;
-        container.appendChild(img);
-      } else if (page.type === 'html') {
-        container.classList.add('ff-content-html');
-        container.innerHTML = page.content;
-      } else if (page.type === 'element') {
-        container.appendChild(page.element.cloneNode(true));
+    geo.attributes.position.needsUpdate = true;
+    geo.computeVertexNormals();
+
+    // Store original positions for deformation reference
+    const origPositions = new Float32Array(pos.length);
+    origPositions.set(pos);
+
+    const frontIdx = leafIndex * 2;
+    const backIdx = leafIndex * 2 + 1;
+
+    const frontTex = textures[frontIdx] || createWhiteTexture(pw, ph);
+    const backTex = backIdx < textures.length
+      ? textures[backIdx]
+      : createWhiteTexture(pw, ph);
+
+    const mat = new ShaderMaterial({
+      vertexShader: PAGE_VERTEX_SHADER,
+      fragmentShader: PAGE_FRAGMENT_SHADER,
+      uniforms: {
+        frontTex: { value: frontTex },
+        backTex: { value: backTex },
+        shadowIntensity: { value: 0.0 },
+      },
+      side: DoubleSide,
+      transparent: false,
+    });
+
+    const mesh = new Mesh(geo, mat);
+
+    // Store metadata on the mesh
+    mesh._ff = {
+      leafIndex,
+      origPositions,
+      flipped: false,
+      flipProgress: 0, // 0=flat right, 1=flat left
+    };
+
+    return mesh;
+  }
+
+  /**
+   * Set a mesh to flat position (flipped or unflipped) without deformation.
+   */
+  _setMeshFlat(meshIndex, flipped) {
+    const mesh = this._meshes[meshIndex];
+    if (!mesh) return;
+
+    const ff = mesh._ff;
+    const pos = mesh.geometry.attributes.position.array;
+    const orig = ff.origPositions;
+    const pw = this._pageWidth;
+
+    if (flipped) {
+      // Mirror all vertices: x' = -x (page lies on left side)
+      for (let i = 0; i < orig.length; i += 3) {
+        pos[i] = -orig[i];
+        pos[i + 1] = orig[i + 1];
+        pos[i + 2] = 0;
       }
-      if (page.className) container.classList.add(page.className);
-      if (page.style) Object.assign(container.style, page.style);
+      ff.flipped = true;
+      ff.flipProgress = 1;
+    } else {
+      // Reset to original positions
+      pos.set(orig);
+      ff.flipped = false;
+      ff.flipProgress = 0;
     }
+
+    mesh.geometry.attributes.position.needsUpdate = true;
+    mesh.geometry.computeVertexNormals();
+  }
+
+  /**
+   * Apply bend deformation to a mesh at a given progress.
+   */
+  _deformMesh(meshIndex, progress) {
+    const mesh = this._meshes[meshIndex];
+    if (!mesh) return;
+
+    const ff = mesh._ff;
+    const pos = mesh.geometry.attributes.position.array;
+    const orig = ff.origPositions;
+    const pw = this._pageWidth;
+    const R = computeCurlRadius(progress, pw);
+
+    deformPageGeometry(pos, orig, progress, pw, R);
+
+    ff.flipProgress = progress;
+    mesh.geometry.attributes.position.needsUpdate = true;
+    mesh.geometry.computeVertexNormals();
+  }
+
+  /**
+   * Update mesh renderOrder and z-position for correct stacking.
+   */
+  _updateMeshOrder() {
+    for (let i = 0; i < this._leafCount; i++) {
+      const mesh = this._meshes[i];
+      if (!mesh) continue;
+
+      const ff = mesh._ff;
+      let depth, shadowVal;
+
+      if (i < this._currentLeaf) {
+        // Flipped (left side): higher index = on top
+        mesh.renderOrder = i;
+        depth = this._currentLeaf - i;
+        mesh.position.z = -depth * 0.1;
+        shadowVal = depth <= 1 ? 0 : Math.min((depth - 1) * 0.15, 0.6);
+      } else {
+        // Unflipped (right side): lower index = on top
+        mesh.renderOrder = this._leafCount - i;
+        depth = i - this._currentLeaf;
+        mesh.position.z = -depth * 0.1;
+        shadowVal = depth === 0 ? 0 : Math.min(depth * 0.12, 0.5);
+      }
+
+      mesh.material.uniforms.shadowIntensity.value = shadowVal;
+    }
+  }
+
+  // ===== Rendering =====
+
+  _render() {
+    if (this._destroyed || !this._renderer) return;
+    this._renderer.render(this._scene, this._camera);
   }
 
   // ===== CSS Injection =====
@@ -276,30 +635,9 @@ class FlipFolio {
   }
 
   _getInlineCSS() {
-    return `.ff-book{--ff-width:800px;--ff-height:600px;--ff-page-width:calc(var(--ff-width)/2);--ff-duration:0.7s;--ff-timing:cubic-bezier(0.4,0.0,0.2,1.0);--ff-bg:#fff;--ff-shadow-color:rgba(0,0,0,0.25);--ff-spine-shadow:rgba(0,0,0,0.3);position:relative;width:var(--ff-width);height:var(--ff-height);margin:0 auto;user-select:none;-webkit-user-select:none;touch-action:none;-ms-touch-action:none}
+    return `.ff-book{--ff-width:800px;--ff-height:600px;position:relative;width:var(--ff-width);height:var(--ff-height);margin:0 auto;user-select:none;-webkit-user-select:none;touch-action:none;-ms-touch-action:none}
 .ff-book.ff-responsive{transform-origin:top center}
-.ff-pages{position:relative;width:100%;height:100%;perspective:2000px;perspective-origin:center center;contain:layout style}
-.ff-leaf{position:absolute;top:0;left:50%;width:var(--ff-page-width);height:100%;transform-origin:left center;transform-style:preserve-3d;--ff-stack-offset:0px;transform:rotateY(0deg) translateX(var(--ff-stack-offset));transition:transform var(--ff-duration) var(--ff-timing);will-change:transform;cursor:default}
-.ff-leaf.ff-flipped{transform:rotateY(-180deg) translateX(var(--ff-stack-offset))}
-.ff-leaf.ff-dragging{transition:none!important;cursor:grabbing}
-.ff-leaf.ff-animating{pointer-events:none}
-.ff-face{position:absolute;top:0;left:0;width:100%;height:100%;backface-visibility:hidden;-webkit-backface-visibility:hidden;overflow:hidden}
-.ff-face-front{z-index:1;background:var(--ff-bg)}
-.ff-face-back{z-index:0;transform:rotateY(180deg);background:var(--ff-bg)}
-.ff-content{position:relative;width:100%;height:100%;overflow:hidden;box-sizing:border-box}
-.ff-content img{width:100%;height:100%;object-fit:cover;display:block;-webkit-user-drag:none;user-select:none;pointer-events:none}
-.ff-content-html{padding:30px}
-.ff-shadow{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;opacity:0;will-change:opacity}
-.ff-shadow-front,.ff-shadow-back{background:none}
-.ff-curl{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;will-change:opacity}
-.ff-cast-shadow{position:absolute;top:0;height:100%;pointer-events:none;opacity:0;z-index:9998;will-change:opacity}
-.ff-cast-shadow-left{left:0;width:50%}
-.ff-cast-shadow-right{left:50%;width:50%}
-.ff-depth-shadow,.ff-depth-shadow-right{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;opacity:0;transition:opacity 0.4s}
-.ff-depth-shadow{background:linear-gradient(to left,rgba(0,0,0,1),transparent 50%)}
-.ff-depth-shadow-right{background:linear-gradient(to right,rgba(0,0,0,1),transparent 50%)}
-.ff-spine-shadow{position:absolute;top:0;left:50%;width:30px;height:100%;transform:translateX(-50%);background:linear-gradient(to right,transparent 0%,rgba(0,0,0,0.08) 20%,var(--ff-spine-shadow) 45%,var(--ff-spine-shadow) 55%,rgba(0,0,0,0.08) 80%,transparent 100%);z-index:9999;pointer-events:none}
-.ff-blank{display:flex;align-items:center;justify-content:center;color:#ccc;font-size:14px}
+.ff-book canvas{display:block}
 .ff-book:focus{outline:2px solid #4a90d9;outline-offset:4px}`;
   }
 
@@ -328,10 +666,10 @@ class FlipFolio {
     }
   }
 
-  // ===== Edge Curl (hover peek at left/right edges) =====
+  // ===== Edge Curl (hover peek) =====
 
   _handleCornerCurl(e) {
-    if (this._animating || this._dragging || this._destroyed) return;
+    if (this._animating || this._dragging || this._destroyed || !this._ready) return;
 
     const rect = this._book.getBoundingClientRect();
     const x = e.clientX - rect.left;
@@ -358,344 +696,68 @@ class FlipFolio {
     if (this._cornerCurling) this._cornerUnpeek();
   }
 
-  _cornerPeek(leafIndex, dir) {
+  _cornerPeek(meshIndex, dir) {
     if (this._cornerCurling) this._cornerUnpeek(true);
 
-    const leaf = this._leaves[leafIndex];
-    if (!leaf) return;
+    const mesh = this._meshes[meshIndex];
+    if (!mesh) return;
 
     this._cornerCurling = true;
-    this._cornerLeaf = leaf;
+    this._cornerMeshIndex = meshIndex;
     this._cornerDir = dir;
 
-    leaf.style.zIndex = this._leafCount + 5;
-    leaf.style.transition = 'transform 0.35s ease-out';
+    // Bring to front
+    mesh.renderOrder = this._leafCount + 5;
+    mesh.position.z = 0.2;
 
-    const peekAngle = this._opts.cornerCurlAngle;
-    const angle = dir === 'forward' ? -peekAngle : -(180 - peekAngle);
-    leaf.style.transform = `rotateY(${angle}deg) translateX(0px)`;
-
-    this._updateCurlEffect(leaf, angle, dir === 'forward');
+    // Small deformation for peek
+    const peekProgress = dir === 'forward' ? 0.05 : 0.95;
+    this._deformMesh(meshIndex, peekProgress);
+    this._render();
   }
 
   _cornerUnpeek(instant) {
-    if (!this._cornerCurling || !this._cornerLeaf) return;
+    if (!this._cornerCurling || this._cornerMeshIndex < 0) return;
 
-    const leaf = this._cornerLeaf;
+    const meshIndex = this._cornerMeshIndex;
+    const mesh = this._meshes[meshIndex];
 
-    if (instant) {
-      // Reset immediately: set transition none + clear transform, force reflow,
-      // then remove inline transition so CSS class transition works for subsequent flips
-      leaf.style.transition = 'none';
-      leaf.style.transform = '';
-      void leaf.offsetHeight;
-      leaf.style.transition = '';
-    } else {
-      // Animate back smoothly
-      leaf.style.transition = 'transform 0.35s ease-out';
-      leaf.style.transform = '';
+    if (mesh) {
+      // Reset to flat position
+      const isFlipped = meshIndex < this._currentLeaf;
+      this._setMeshFlat(meshIndex, isFlipped);
     }
 
-    this._clearCurlEffect(leaf);
+    this._updateMeshOrder();
 
     if (!instant) {
-      const ref = leaf;
-      setTimeout(() => {
-        ref.style.transition = '';
-        this._updateZIndex();
-      }, 360);
+      // Animate back - but for simplicity we just render the final state
+      this._render();
     } else {
-      this._updateZIndex();
+      this._render();
     }
 
     this._cornerCurling = false;
-    this._cornerLeaf = null;
+    this._cornerMeshIndex = -1;
     this._cornerDir = null;
-  }
-
-  // ===== Curl Effect Engine =====
-
-  /**
-   * Build a multi-stop linear-gradient simulating cylindrical paper curl.
-   * concave shadow -> specular highlight -> convex shadow -> S-curve highlight -> edge glow
-   */
-  _buildCurlGradient(pos, width, intensity, dir) {
-    const s = intensity * 0.70;
-    const h = intensity * 0.95;
-    const w = width;
-    const p = pos;
-    const c = (v) => clamp(v, 0, 100).toFixed(1);
-    const a = (v) => Math.max(0, v).toFixed(3);
-
-    return (
-      `linear-gradient(to ${dir}, ` +
-      `transparent ${c(p - w)}%, ` +
-      `rgba(0,0,0,${a(s * 0.03)}) ${c(p - w * 0.9)}%, ` +
-      `rgba(0,0,0,${a(s * 0.1)}) ${c(p - w * 0.76)}%, ` +
-      `rgba(0,0,0,${a(s * 0.3)}) ${c(p - w * 0.58)}%, ` +
-      `rgba(0,0,0,${a(s * 0.6)}) ${c(p - w * 0.4)}%, ` +
-      `rgba(0,0,0,${a(s * 0.85)}) ${c(p - w * 0.24)}%, ` +
-      `rgba(0,0,0,${a(s)}) ${c(p - w * 0.1)}%, ` +
-      `rgba(0,0,0,${a(s * 0.7)}) ${c(p - 4)}%, ` +
-      `rgba(255,255,255,${a(h * 0.2)}) ${c(p - 2.5)}%, ` +
-      `rgba(255,255,255,${a(h * 0.65)}) ${c(p - 1)}%, ` +
-      `rgba(255,255,255,${a(h)}) ${c(p)}%, ` +
-      `rgba(255,255,255,${a(h * 0.65)}) ${c(p + 1)}%, ` +
-      `rgba(255,255,255,${a(h * 0.2)}) ${c(p + 2.5)}%, ` +
-      `rgba(0,0,0,${a(s * 0.55)}) ${c(p + w * 0.06)}%, ` +
-      `rgba(0,0,0,${a(s * 0.35)}) ${c(p + w * 0.16)}%, ` +
-      `rgba(0,0,0,${a(s * 0.2)}) ${c(p + w * 0.28)}%, ` +
-      `rgba(255,255,255,${a(h * 0.05)}) ${c(p + w * 0.36)}%, ` +
-      `rgba(255,255,255,${a(h * 0.1)}) ${c(p + w * 0.44)}%, ` +
-      `rgba(255,255,255,${a(h * 0.05)}) ${c(p + w * 0.52)}%, ` +
-      `rgba(0,0,0,${a(s * 0.08)}) ${c(p + w * 0.64)}%, ` +
-      `rgba(0,0,0,${a(s * 0.03)}) ${c(p + w * 0.78)}%, ` +
-      `rgba(255,255,255,${a(h * 0.08)}) ${c(p + w * 0.88)}%, ` +
-      `rgba(255,255,255,${a(h * 0.18)}) ${c(p + w * 0.96)}%, ` +
-      `transparent ${c(p + w)}%)`
-    );
-  }
-
-  /**
-   * Update all curl visual effects for a leaf at a given rotation angle.
-   * Uses cached _ff references for performance.
-   *
-   * Shadow model:
-   *  1. Curl gradient overlay — cylindrical fold highlight/shadow on the turning page
-   *  2. Dynamic self-shadow — fold-edge shadow that spreads across the page face
-   *  3. Paper edge — multi-layer inset box-shadow for thickness illusion
-   *  4. Cast shadow — umbra + penumbra on the underlying pages, width grows with lift
-   */
-  _updateCurlEffect(leaf, angle, forward) {
-    const progress = Math.abs(angle) / 180;
-    const curlIntensity = Math.sin(progress * Math.PI);
-    const curlWidth = 30 + curlIntensity * 55;
-    const refs = leaf._ff;
-    const angleRad = Math.abs(angle) * (Math.PI / 180);
-
-    // --- 1. Curl gradient overlay (cylindrical fold simulation) ---
-    const frontPos = (1 - progress) * 100;
-    if (refs.frontCurl) {
-      refs.frontCurl.style.background =
-        curlIntensity > 0.01
-          ? this._buildCurlGradient(frontPos, curlWidth, curlIntensity, 'right')
-          : 'none';
-    }
-    const backPos = progress * 100;
-    if (refs.backCurl) {
-      refs.backCurl.style.background =
-        curlIntensity > 0.01
-          ? this._buildCurlGradient(backPos, curlWidth, curlIntensity, 'left')
-          : 'none';
-    }
-
-    // --- 2. Dynamic self-shadow on faces ---
-    // Simulates the shadow cast by the lifted page near the fold crease.
-    // The gradient originates at the fold edge (spine side) and fades inward.
-    // Spread and intensity grow as the page lifts toward vertical.
-    const foldI = curlIntensity * 0.45;
-    const spreadPct = 12 + curlIntensity * 40;
-
-    if (refs.frontShadow) {
-      if (foldI > 0.01) {
-        refs.frontShadow.style.opacity = '1';
-        refs.frontShadow.style.background =
-          `linear-gradient(to right, ` +
-          `rgba(0,0,0,${(foldI * 0.55).toFixed(3)}) 0%, ` +
-          `rgba(0,0,0,${(foldI * 0.3).toFixed(3)}) ${(spreadPct * 0.35).toFixed(1)}%, ` +
-          `rgba(0,0,0,${(foldI * 0.1).toFixed(3)}) ${spreadPct.toFixed(1)}%, ` +
-          `transparent ${(spreadPct * 1.6).toFixed(1)}%)`;
-      } else {
-        refs.frontShadow.style.opacity = '0';
-      }
-    }
-    if (refs.backShadow) {
-      if (foldI > 0.01) {
-        refs.backShadow.style.opacity = '1';
-        refs.backShadow.style.background =
-          `linear-gradient(to left, ` +
-          `rgba(0,0,0,${(foldI * 0.55).toFixed(3)}) 0%, ` +
-          `rgba(0,0,0,${(foldI * 0.3).toFixed(3)}) ${(spreadPct * 0.35).toFixed(1)}%, ` +
-          `rgba(0,0,0,${(foldI * 0.1).toFixed(3)}) ${spreadPct.toFixed(1)}%, ` +
-          `transparent ${(spreadPct * 1.6).toFixed(1)}%)`;
-      } else {
-        refs.backShadow.style.opacity = '0';
-      }
-    }
-
-    // --- 3. Paper edge thickness (multi-layer inset box-shadow) ---
-    // Layer 1: dark outer edge shadow
-    // Layer 2: bright specular highlight on paper edge
-    // Layer 3: subtle inner ambient shadow for depth
-    const edgeI = curlIntensity;
-    if (refs.frontFace) {
-      refs.frontFace.style.boxShadow =
-        edgeI > 0.02
-          ? `inset -3px 0 ${(12 * edgeI).toFixed(1)}px rgba(0,0,0,${(0.28 * edgeI).toFixed(3)}), ` +
-            `inset -1px 0 0 rgba(255,255,255,${(0.5 * edgeI).toFixed(3)}), ` +
-            `inset 4px 0 ${(18 * edgeI).toFixed(1)}px rgba(0,0,0,${(0.08 * edgeI).toFixed(3)})`
-          : '';
-    }
-    if (refs.backFace) {
-      refs.backFace.style.boxShadow =
-        edgeI > 0.02
-          ? `inset 3px 0 ${(12 * edgeI).toFixed(1)}px rgba(0,0,0,${(0.28 * edgeI).toFixed(3)}), ` +
-            `inset 1px 0 0 rgba(255,255,255,${(0.5 * edgeI).toFixed(3)}), ` +
-            `inset -4px 0 ${(18 * edgeI).toFixed(1)}px rgba(0,0,0,${(0.08 * edgeI).toFixed(3)})`
-          : '';
-    }
-
-    // --- 4. Cast shadow on underlying pages ---
-    // Physics-based: shadow penumbra widens as the page lifts further from the surface.
-    // liftHeight ~ sin(angle) peaks at 90°.
-    // Umbra = hard shadow core near the spine; penumbra = soft outer fade.
-    const liftHeight = Math.sin(angleRad);
-    const castI = curlIntensity * 0.65;
-    const umbra = 4 + liftHeight * 18;
-    const penumbra = 12 + liftHeight * 80;
-
-    if (forward || progress < 0.5) {
-      if (castI > 0.01) {
-        this._castShadowRight.style.opacity = '1';
-        this._castShadowRight.style.background =
-          `linear-gradient(to right, ` +
-          `rgba(0,0,0,${(castI * 1.0).toFixed(3)}) 0px, ` +
-          `rgba(0,0,0,${(castI * 0.8).toFixed(3)}) ${umbra.toFixed(0)}px, ` +
-          `rgba(0,0,0,${(castI * 0.35).toFixed(3)}) ${penumbra.toFixed(0)}px, ` +
-          `rgba(0,0,0,${(castI * 0.08).toFixed(3)}) ${(penumbra * 1.8).toFixed(0)}px, ` +
-          `transparent ${(penumbra * 3).toFixed(0)}px)`;
-      } else {
-        this._castShadowRight.style.opacity = '0';
-      }
-    }
-    if (!forward || progress >= 0.5) {
-      if (castI > 0.01) {
-        this._castShadowLeft.style.opacity = '1';
-        this._castShadowLeft.style.background =
-          `linear-gradient(to left, ` +
-          `rgba(0,0,0,${(castI * 1.0).toFixed(3)}) 0px, ` +
-          `rgba(0,0,0,${(castI * 0.8).toFixed(3)}) ${umbra.toFixed(0)}px, ` +
-          `rgba(0,0,0,${(castI * 0.35).toFixed(3)}) ${penumbra.toFixed(0)}px, ` +
-          `rgba(0,0,0,${(castI * 0.08).toFixed(3)}) ${(penumbra * 1.8).toFixed(0)}px, ` +
-          `transparent ${(penumbra * 3).toFixed(0)}px)`;
-      } else {
-        this._castShadowLeft.style.opacity = '0';
-      }
-    }
-
-    // --- 5. Page curl geometry (clip-path) ---
-    // Curves the free edge of each face inward to simulate paper bending.
-    // The curve follows a sine profile along the page height, peaking at center.
-    // Front face: right edge curves in. Back face: left edge curves in (local coords).
-    const curlDepth = curlIntensity * 10; // max 10% of page width at peak
-    if (curlDepth > 0.3) {
-      const N = 12;
-      // Front face — curve right edge
-      let fp = '0% 0%';
-      for (let i = 0; i <= N; i++) {
-        const t = i / N;
-        const d = curlDepth * Math.sin(t * Math.PI);
-        fp += `, ${(100 - d).toFixed(2)}% ${(t * 100).toFixed(1)}%`;
-      }
-      fp += ', 0% 100%';
-      refs.frontFace.style.clipPath = `polygon(${fp})`;
-
-      // Back face — curve left edge (in local coords, before its rotateY(180deg))
-      let bp = '';
-      for (let i = 0; i <= N; i++) {
-        const t = i / N;
-        const d = curlDepth * Math.sin(t * Math.PI);
-        bp += (i > 0 ? ', ' : '') + `${d.toFixed(2)}% ${(t * 100).toFixed(1)}%`;
-      }
-      bp += ', 100% 100%, 100% 0%';
-      refs.backFace.style.clipPath = `polygon(${bp})`;
-    } else {
-      refs.frontFace.style.clipPath = '';
-      refs.backFace.style.clipPath = '';
-    }
-  }
-
-  _clearCurlEffect(leaf) {
-    if (this._curlRAF) {
-      cancelAnimationFrame(this._curlRAF);
-      this._curlRAF = null;
-    }
-
-    const refs = leaf._ff;
-    if (refs.frontCurl) refs.frontCurl.style.background = 'none';
-    if (refs.backCurl) refs.backCurl.style.background = 'none';
-    if (refs.frontShadow) {
-      refs.frontShadow.style.opacity = '0';
-      refs.frontShadow.style.background = '';
-    }
-    if (refs.backShadow) {
-      refs.backShadow.style.opacity = '0';
-      refs.backShadow.style.background = '';
-    }
-    if (refs.frontFace) {
-      refs.frontFace.style.boxShadow = '';
-      refs.frontFace.style.clipPath = '';
-    }
-    if (refs.backFace) {
-      refs.backFace.style.boxShadow = '';
-      refs.backFace.style.clipPath = '';
-    }
-    if (refs.frontDepth) refs.frontDepth.style.opacity = 0;
-    if (refs.backDepth) refs.backDepth.style.opacity = 0;
-
-    this._castShadowLeft.style.opacity = '0';
-    this._castShadowLeft.style.background = '';
-    this._castShadowRight.style.opacity = '0';
-    this._castShadowRight.style.background = '';
-  }
-
-  /**
-   * RAF loop that drives curl effect in sync with CSS transition.
-   * @param {Element} leaf
-   * @param {boolean} forward - shadow direction
-   * @param {number} [fromAngle] - start angle (for drag-to-flip continuity)
-   * @param {number} [toAngle] - explicit end angle (for snap-back)
-   */
-  _animateCurl(leaf, forward, fromAngle, toAngle, customDuration, customEase) {
-    const startTime = performance.now();
-    const duration = (customDuration !== undefined ? customDuration : this._opts.duration) * 1000;
-    const startAngle =
-      fromAngle !== undefined ? fromAngle : forward ? 0 : -180;
-    const endAngle =
-      toAngle !== undefined ? toAngle : forward ? -180 : 0;
-    const easeFn = customEase || naturalEase;
-
-    const tick = () => {
-      const elapsed = performance.now() - startTime;
-      const t = clamp(elapsed / duration, 0, 1);
-      const easedT = easeFn(t);
-      const currentAngle = startAngle + (endAngle - startAngle) * easedT;
-
-      this._updateCurlEffect(leaf, currentAngle, forward);
-
-      if (t < 1) {
-        this._curlRAF = requestAnimationFrame(tick);
-      }
-    };
-
-    this._curlRAF = requestAnimationFrame(tick);
   }
 
   // ===== Flip API =====
 
   flipNext() {
-    if (this._animating || this._currentLeaf >= this._leafCount) return;
+    if (this._animating || !this._ready || this._currentLeaf >= this._leafCount) return;
     if (this._cornerCurling) this._cornerUnpeek(true);
     this._flipLeaf(this._currentLeaf, true);
   }
 
   flipPrev() {
-    if (this._animating || this._currentLeaf <= 0) return;
+    if (this._animating || !this._ready || this._currentLeaf <= 0) return;
     if (this._cornerCurling) this._cornerUnpeek(true);
     this._flipLeaf(this._currentLeaf - 1, false);
   }
 
   flipTo(pageIndex) {
+    if (!this._ready) return;
     if (this._cornerCurling) this._cornerUnpeek(true);
 
     const clampedTarget = Math.max(
@@ -704,24 +766,15 @@ class FlipFolio {
     );
     if (clampedTarget === this._currentLeaf) return;
 
-    const duration = this._opts.duration;
-    this._book.style.setProperty('--ff-duration', '0s');
-
+    // Instantly set all meshes
     for (let i = 0; i < this._leafCount; i++) {
-      if (i < clampedTarget) {
-        this._leaves[i].classList.add('ff-flipped');
-      } else {
-        this._leaves[i].classList.remove('ff-flipped');
-      }
+      this._setMeshFlat(i, i < clampedTarget);
     }
 
     this._currentLeaf = clampedTarget;
-    this._updateZIndex();
-
-    requestAnimationFrame(() => {
-      this._book.style.setProperty('--ff-duration', duration + 's');
-      this._emit('flip', { page: this.currentPage, leaf: this._currentLeaf });
-    });
+    this._updateMeshOrder();
+    this._render();
+    this._emit('flip', { page: this.currentPage, leaf: this._currentLeaf });
   }
 
   get currentPage() {
@@ -733,110 +786,139 @@ class FlipFolio {
   }
 
   /**
-   * Core flip animation.
-   * @param {number} leafIndex
-   * @param {boolean} forward
-   * @param {number} [fromAngle] - current angle if continuing from drag
-   * @param {number} [duration] - custom duration in seconds (inertia-driven)
+   * Core flip animation using RAF loop with geometry deformation.
+   * @param {number} meshIndex - index of leaf mesh
+   * @param {boolean} forward - flip direction
+   * @param {number} [fromProgress] - start progress if continuing from drag (0-1)
+   * @param {number} [duration] - custom duration in seconds
    */
-  _flipLeaf(leafIndex, forward, fromAngle, duration) {
-    const leaf = this._leaves[leafIndex];
-    if (!leaf) return;
+  _flipLeaf(meshIndex, forward, fromProgress, duration) {
+    const mesh = this._meshes[meshIndex];
+    if (!mesh) return;
 
     this._animating = true;
-    leaf.classList.add('ff-animating');
-    leaf.style.zIndex = this._leafCount + 10;
 
-    // Use custom duration with ease-out curve if inertia-driven, otherwise default
-    const dur = duration !== undefined ? duration : this._opts.duration;
-    const isInertia = duration !== undefined;
-    const curveCss = isInertia ? 'cubic-bezier(0,0,0.2,1)' : this._opts.timing;
-    const easeFn = isInertia ? easeOut : naturalEase;
+    // Bring mesh to top
+    mesh.renderOrder = this._leafCount + 10;
+    mesh.position.z = 0.3;
 
-    leaf.style.transition = `transform ${dur}s ${curveCss}`;
+    const startProgress = fromProgress !== undefined
+      ? fromProgress
+      : (forward ? 0 : 1);
+    const endProgress = forward ? 1 : 0;
+    const dur = (duration !== undefined ? duration : this._opts.duration) * 1000;
+    const startTime = performance.now();
 
-    // Set target rotation via CSS class
-    if (forward) {
-      leaf.classList.add('ff-flipped');
-    } else {
-      leaf.classList.remove('ff-flipped');
-    }
+    const tick = () => {
+      if (this._destroyed) return;
 
-    // Clear inline transform — CSS transition animates from current rendered
-    // position (0deg, -180deg, or drag angle) to the class-defined target
-    leaf.style.transform = '';
+      const elapsed = performance.now() - startTime;
+      const t = clamp(elapsed / dur, 0, 1);
+      const easedT = duration !== undefined ? easeOutCubic(t) : easeInOutCubic(t);
+      const progress = startProgress + (endProgress - startProgress) * easedT;
 
-    // Sync curl gradient effect with the CSS transition
-    this._animateCurl(leaf, forward, fromAngle, undefined, dur, easeFn);
+      this._deformMesh(meshIndex, progress);
+      this._render();
 
-    const onEnd = () => {
-      leaf.removeEventListener('transitionend', onTransitionEnd);
-      clearTimeout(fallbackTimer);
-
-      leaf.classList.remove('ff-animating');
-      leaf.style.transition = '';
-      this._clearCurlEffect(leaf);
-
-      this._currentLeaf = forward ? leafIndex + 1 : leafIndex;
-      this._animating = false;
-      this._updateZIndex();
-      this._emit('flip', { page: this.currentPage, leaf: this._currentLeaf });
+      if (t < 1) {
+        this._flipRAF = requestAnimationFrame(tick);
+      } else {
+        // Animation complete - set to final flat state
+        this._setMeshFlat(meshIndex, forward);
+        this._currentLeaf = forward ? meshIndex + 1 : meshIndex;
+        this._animating = false;
+        this._updateMeshOrder();
+        this._render();
+        this._emit('flip', { page: this.currentPage, leaf: this._currentLeaf });
+      }
     };
 
-    const onTransitionEnd = (e) => {
-      if (e.target === leaf && e.propertyName === 'transform') onEnd();
+    this._flipRAF = requestAnimationFrame(tick);
+  }
+
+  /**
+   * Snap-back animation (drag released past threshold, return to original).
+   */
+  _snapBack(meshIndex, fromProgress, forward, duration) {
+    const mesh = this._meshes[meshIndex];
+    if (!mesh) return;
+
+    this._animating = true;
+    mesh.renderOrder = this._leafCount + 10;
+    mesh.position.z = 0.3;
+
+    const endProgress = forward ? 0 : 1; // snap back to where it was
+    const dur = (duration || this._opts.duration) * 1000;
+    const startTime = performance.now();
+
+    const tick = () => {
+      if (this._destroyed) return;
+
+      const elapsed = performance.now() - startTime;
+      const t = clamp(elapsed / dur, 0, 1);
+      const easedT = easeOutCubic(t);
+      const progress = fromProgress + (endProgress - fromProgress) * easedT;
+
+      this._deformMesh(meshIndex, progress);
+      this._render();
+
+      if (t < 1) {
+        this._flipRAF = requestAnimationFrame(tick);
+      } else {
+        const isFlipped = meshIndex < this._currentLeaf;
+        this._setMeshFlat(meshIndex, isFlipped);
+        this._animating = false;
+        this._updateMeshOrder();
+        this._render();
+      }
     };
 
-    leaf.addEventListener('transitionend', onTransitionEnd);
-    const fallbackTimer = setTimeout(
-      onEnd,
-      (dur + 0.1) * 1000
-    );
+    this._flipRAF = requestAnimationFrame(tick);
   }
 
   // ===== Drag Handling =====
 
   _handlePointerDown(e) {
-    if (this._animating || this._destroyed || e.button !== 0) return;
+    if (this._animating || this._destroyed || !this._ready || e.button !== 0) return;
 
     if (this._cornerCurling) this._cornerUnpeek(true);
 
     const rect = this._book.getBoundingClientRect();
     this._dragRect = rect;
-    this._dragSpineX = rect.left + rect.width / 2;
-    this._dragPageWidth = rect.width / 2;
-    const spineX = this._dragSpineX;
-    const pageWidth = this._dragPageWidth;
     const relX = e.clientX - rect.left;
+    const halfW = rect.width / 2;
 
-    let leafIndex, dragForward;
-    if (relX > rect.width / 2) {
-      leafIndex = this._currentLeaf;
+    let meshIndex, dragForward;
+    if (relX > halfW) {
+      meshIndex = this._currentLeaf;
       dragForward = true;
     } else {
-      leafIndex = this._currentLeaf - 1;
+      meshIndex = this._currentLeaf - 1;
       dragForward = false;
     }
 
-    if (leafIndex < 0 || leafIndex >= this._leafCount) return;
+    if (meshIndex < 0 || meshIndex >= this._leafCount) return;
 
     this._dragging = true;
     this._dragForward = dragForward;
-    this._dragLeaf = this._leaves[leafIndex];
-    this._dragLeafIndex = leafIndex;
-    this._dragAngle = dragForward ? 0 : -180;
+    this._dragMeshIndex = meshIndex;
+    this._dragProgress = dragForward ? 0 : 1;
 
-    // Edge offset: distance from pointer to the page's free edge.
-    // This ensures the page edge tracks the pointer without an initial jump.
+    // Edge offset for smooth tracking
+    const spineX = rect.left + halfW;
+    const pageWidth = halfW;
     if (dragForward) {
       this._dragEdgeOffset = (spineX + pageWidth) - e.clientX;
     } else {
       this._dragEdgeOffset = (spineX - pageWidth) - e.clientX;
     }
+    this._dragSpineX = spineX;
+    this._dragPageWidth = pageWidth;
 
-    this._dragLeaf.classList.add('ff-dragging');
-    this._dragLeaf.style.zIndex = this._leafCount + 10;
-    this._dragLeaf.style.setProperty('--ff-stack-offset', '0px');
+    // Bring mesh to top
+    const mesh = this._meshes[meshIndex];
+    mesh.renderOrder = this._leafCount + 10;
+    mesh.position.z = 0.3;
 
     this._velocitySamples = [];
 
@@ -845,45 +927,39 @@ class FlipFolio {
   }
 
   _handlePointerMove(e) {
-    if (!this._dragging || !this._dragLeaf) return;
-
+    if (!this._dragging) return;
     e.preventDefault();
 
     const spineX = this._dragSpineX;
     const pageWidth = this._dragPageWidth;
 
-    // Target edge position = pointer + initial offset from edge
+    // Target edge position
     const targetEdgeX = e.clientX + this._dragEdgeOffset;
 
-    // Map edge position to rotation angle:
-    // edgeX = spineX + pageWidth * cos(angle)  →  angle = -acos(...)
+    // Map edge position to progress (0-1)
+    // cosAngle maps from [-1, 1], angle from [0, PI], progress from [0, 1]
     const cosAngle = clamp((targetEdgeX - spineX) / pageWidth, -1, 1);
-    const angle = -Math.acos(cosAngle) * (180 / Math.PI);
+    const progress = Math.acos(cosAngle) / Math.PI;
 
-    this._dragAngle = angle;
-    this._dragLeaf.style.transform = `rotateY(${angle}deg) translateX(0px)`;
-    this._updateCurlEffect(this._dragLeaf, angle, this._dragForward);
+    this._dragProgress = progress;
+    this._deformMesh(this._dragMeshIndex, progress);
+    this._render();
 
-    // Track velocity samples
+    // Track velocity
     const now = performance.now();
-    this._velocitySamples.push({ angle, time: now });
+    this._velocitySamples.push({ progress, time: now });
     if (this._velocitySamples.length > 5) this._velocitySamples.shift();
   }
 
   _handlePointerUp() {
-    if (!this._dragging || !this._dragLeaf) return;
+    if (!this._dragging) return;
 
     this._dragging = false;
-    const leaf = this._dragLeaf;
-    const dragAngle = this._dragAngle;
-
-    // Re-enable CSS transition (was disabled by ff-dragging)
-    leaf.classList.remove('ff-dragging');
-
-    const progress = Math.abs(dragAngle) / 180;
+    const meshIndex = this._dragMeshIndex;
+    const dragProgress = this._dragProgress;
     const threshold = this._opts.dragThreshold;
 
-    // Compute velocity from recent samples
+    // Compute velocity
     let velocity = 0;
     const samples = this._velocitySamples;
     if (samples.length >= 2) {
@@ -895,79 +971,44 @@ class FlipFolio {
       const last = samples[samples.length - 1];
       const dt = last.time - first.time;
       if (dt > 5) {
-        velocity = ((last.angle - first.angle) / dt) * 1000; // deg/s
+        velocity = ((last.progress - first.progress) / dt) * 1000; // progress/s
       }
     }
 
     let shouldFlip;
     if (this._dragForward) {
-      shouldFlip = progress > threshold;
+      shouldFlip = dragProgress > threshold;
     } else {
-      shouldFlip = progress < 1 - threshold;
+      shouldFlip = dragProgress < 1 - threshold;
     }
 
     // Velocity override
     const velThreshold = this._opts.velocityThreshold;
     if (Math.abs(velocity) > velThreshold) {
       if (this._dragForward) {
-        shouldFlip = velocity < -velThreshold;
+        shouldFlip = velocity > velThreshold; // positive velocity = increasing progress = flipping forward
       } else {
-        shouldFlip = velocity > velThreshold;
+        shouldFlip = velocity < -velThreshold;
       }
     }
 
-    // Calculate dynamic duration based on velocity
+    // Calculate dynamic duration
     const baseDuration = this._opts.duration;
-    const remainingDeg = shouldFlip
-      ? (this._dragForward ? 180 - Math.abs(dragAngle) : Math.abs(dragAngle))
-      : (this._dragForward ? Math.abs(dragAngle) : 180 - Math.abs(dragAngle));
+    const remainingProgress = shouldFlip
+      ? (this._dragForward ? 1 - dragProgress : dragProgress)
+      : (this._dragForward ? dragProgress : 1 - dragProgress);
     let duration;
     if (Math.abs(velocity) > velThreshold) {
-      duration = clamp(remainingDeg / Math.abs(velocity), 0.15, baseDuration);
+      duration = clamp(remainingProgress / Math.abs(velocity), 0.15, baseDuration);
     } else {
-      duration = clamp(baseDuration * (remainingDeg / 180), 0.2, baseDuration);
+      duration = clamp(baseDuration * remainingProgress, 0.2, baseDuration);
     }
 
     if (shouldFlip) {
-      // Complete the flip — animate from drag angle to target
-      this._flipLeaf(this._dragLeafIndex, this._dragForward, dragAngle, duration);
+      this._flipLeaf(meshIndex, this._dragForward, dragProgress, duration);
     } else {
-      // Snap back with animated curl effect
-      this._animating = true;
-      leaf.classList.add('ff-animating');
-
-      const isInertia = Math.abs(velocity) > velThreshold;
-      const easeFn = isInertia ? easeOut : naturalEase;
-      const curveCss = isInertia
-        ? 'cubic-bezier(0,0,0.2,1)' : this._opts.timing;
-
-      leaf.style.transition = `transform ${duration}s ${curveCss}`;
-      leaf.style.transform = ''; // CSS transition animates to class-defined rotation
-
-      // Animate curl in sync: forward snap → back to 0°, backward snap → back to -180°
-      const snapTarget = this._dragForward ? 0 : -180;
-      this._animateCurl(leaf, this._dragForward, dragAngle, snapTarget, duration, easeFn);
-
-      const onEnd = () => {
-        clearTimeout(fallback);
-        leaf.removeEventListener('transitionend', onTE);
-        leaf.classList.remove('ff-animating');
-        leaf.style.transition = '';
-        this._clearCurlEffect(leaf);
-        this._animating = false;
-        this._updateZIndex();
-      };
-      const onTE = (ev) => {
-        if (ev.target === leaf && ev.propertyName === 'transform') onEnd();
-      };
-      leaf.addEventListener('transitionend', onTE);
-      const fallback = setTimeout(
-        onEnd,
-        (duration + 0.1) * 1000
-      );
+      this._snapBack(meshIndex, dragProgress, this._dragForward, duration);
     }
-
-    this._dragLeaf = null;
   }
 
   // ===== Keyboard =====
@@ -993,42 +1034,6 @@ class FlipFolio {
         e.preventDefault();
         this.flipTo(this._pages.length - 1);
         break;
-    }
-  }
-
-  // ===== Z-Index Management =====
-
-  _updateZIndex() {
-    const thickness = this._opts.pageThickness;
-    const maxOffset = this._opts.maxStackOffset;
-
-    for (let i = 0; i < this._leafCount; i++) {
-      const leaf = this._leaves[i];
-      const refs = leaf._ff;
-
-      if (i < this._currentLeaf) {
-        // Flipped leaves (left side): higher index = on top
-        leaf.style.zIndex = i;
-        const depth = this._currentLeaf - i;
-        const offset = Math.min(depth * thickness, maxOffset);
-        leaf.style.setProperty('--ff-stack-offset', offset + 'px');
-        // Depth shadow on back face (visible when flipped)
-        if (refs.backDepth) {
-          refs.backDepth.style.opacity = depth <= 1 ? 0 : Math.min((depth - 1) * 0.15, 0.6);
-        }
-        if (refs.frontDepth) refs.frontDepth.style.opacity = 0;
-      } else {
-        // Unflipped leaves (right side): lower index = on top
-        leaf.style.zIndex = this._leafCount - i;
-        const depth = i - this._currentLeaf;
-        const offset = Math.min(depth * thickness, maxOffset);
-        leaf.style.setProperty('--ff-stack-offset', offset + 'px');
-        // Depth shadow on front face (darkens deeper pages)
-        if (refs.frontDepth) {
-          refs.frontDepth.style.opacity = depth === 0 ? 0 : Math.min(depth * 0.12, 0.5);
-        }
-        if (refs.backDepth) refs.backDepth.style.opacity = 0;
-      }
     }
   }
 
@@ -1075,9 +1080,9 @@ class FlipFolio {
   destroy() {
     this._destroyed = true;
 
-    if (this._curlRAF) {
-      cancelAnimationFrame(this._curlRAF);
-      this._curlRAF = null;
+    if (this._flipRAF) {
+      cancelAnimationFrame(this._flipRAF);
+      this._flipRAF = null;
     }
     if (this._cornerCurling) this._cornerUnpeek(true);
 
@@ -1095,8 +1100,33 @@ class FlipFolio {
       window.removeEventListener('resize', this._onResize);
     }
 
+    // Dispose Three.js resources
+    if (this._meshes) {
+      for (const mesh of this._meshes) {
+        mesh.geometry.dispose();
+        mesh.material.dispose();
+        if (mesh.material.uniforms) {
+          const ft = mesh.material.uniforms.frontTex?.value;
+          const bt = mesh.material.uniforms.backTex?.value;
+          if (ft) ft.dispose();
+          if (bt) bt.dispose();
+        }
+      }
+    }
+
+    if (this._spineShadow) {
+      this._spineShadow.geometry.dispose();
+      this._spineShadow.material.dispose();
+    }
+
+    if (this._renderer) {
+      this._renderer.dispose();
+      this._renderer.forceContextLoss();
+    }
+
     this._el.removeChild(this._book);
-    this._leaves = [];
+    this._meshes = [];
+    this._textures = [];
     this._listeners = {};
     this._emit('destroy');
   }
