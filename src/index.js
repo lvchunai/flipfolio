@@ -7,7 +7,7 @@
 import {
   WebGLRenderer,
   Scene,
-  PerspectiveCamera,
+  OrthographicCamera,
   AmbientLight,
   DirectionalLight,
   PlaneGeometry,
@@ -393,11 +393,11 @@ class FlipFolio {
 
     this._scene = new Scene();
 
-    // Camera: position so the book fills the view
-    const fov = 45;
-    const dist = (this._pageHeight / 2) / Math.tan((fov / 2) * Math.PI / 180);
-    this._camera = new PerspectiveCamera(fov, o.width / o.height, 1, dist * 3);
-    this._camera.position.set(0, 0, dist);
+    // Orthographic camera — no perspective distortion on stacked pages
+    const halfW = o.width / 2;
+    const halfH = o.height / 2;
+    this._camera = new OrthographicCamera(-halfW, halfW, halfH, -halfH, 0.1, 1000);
+    this._camera.position.set(0, 0, 500);
     this._camera.lookAt(0, 0, 0);
 
     // Lighting
@@ -405,7 +405,7 @@ class FlipFolio {
     this._scene.add(ambient);
 
     const dirLight = new DirectionalLight(0xffffff, 0.4);
-    dirLight.position.set(0, dist * 0.5, dist);
+    dirLight.position.set(0, 250, 500);
     this._scene.add(dirLight);
 
     // Spine shadow (vertical semi-transparent plane at x=0)
@@ -418,8 +418,8 @@ class FlipFolio {
       side: FrontSide,
     });
     this._spineShadow = new Mesh(spineGeo, spineMat);
-    this._spineShadow.position.set(0, 0, 0.5);
-    this._spineShadow.renderOrder = 1000;
+    this._spineShadow.position.set(0, 0, -2);
+    this._spineShadow.renderOrder = -1;
     this._scene.add(this._spineShadow);
 
     this._book.appendChild(this._canvas);
